@@ -1,10 +1,10 @@
 ---
-user: centos
-group: centos
+user: david.chang
+group: david.chang
 chdir: /opt/cm/slack-commands
 log: log/thin.log
 port: 4200
 environment: production
 address: 127.0.0.1
 pid: log/thin.pid
-servers: 5
+servers: 4

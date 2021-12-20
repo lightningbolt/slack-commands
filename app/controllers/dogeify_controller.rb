@@ -1,31 +1,10 @@
-require 'core_ext/range/weighted_array'
-require 'fileutils'
+require "doger"
+require "fileutils"
+require "google/cloud/storage"
 
 class DogeifyController < ApplicationController
   BASE_IMAGE_DIR = File.join(Rails.root, "lib", "assets", "dogeify")
-  COLORS = [
-    "rgb(221,0,204)",   # magenta
-    "rgb(255,51,51)",   # red
-    "rgb(255,136,0)",   # orange
-    "rgb(225,225,0)",   # yellow
-    "rgb(0,255,0)",     # green
-    "rgb(0,255,255)",   # cyan
-    "rgb(51,51,255)",   # blue
-    "rgb(127,0,255)",   # purple
-    "rgb(255,255,255)"  # white
-  ] 
-  GRAVITIES = [
-#   [:Center,    { x: (-113 .. 113).to_weighted_array, y: (-113 .. 113).to_weighted_array }],
-    [:East,      { x: (0    .. 200).to_weighted_array, y: (-113 .. 113).to_weighted_array }],
-    [:North,     { x: (-113 .. 113).to_weighted_array, y: (0    .. 80 ).to_weighted_array }],
-    [:NorthEast, { x: (0    .. 220).to_weighted_array, y: (0    .. 226).to_weighted_array }],
-    [:NorthWest, { x: (0    .. 220).to_weighted_array, y: (0    .. 226).to_weighted_array }],
-    [:South,     { x: (-113 .. 113).to_weighted_array, y: (0    .. 80 ).to_weighted_array }],
-    [:SouthEast, { x: (0    .. 220).to_weighted_array, y: (0    .. 226).to_weighted_array }],
-    [:SouthWest, { x: (0    .. 220).to_weighted_array, y: (0    .. 226).to_weighted_array }],
-    [:West,      { x: (0    .. 200).to_weighted_array, y: (-113 .. 113).to_weighted_array }]
-  ]
-  PUBLIC_DIR = File.join(Rails.root, "public", "dogeify")
+  GCS_BUCKET = Google::Cloud::Storage.new.bucket("dogeify")
   SECTIONS = [1, 2, 3, 4]
   SECTION_RANGES = {
     1 => (1..30),
@@ -33,8 +12,14 @@ class DogeifyController < ApplicationController
     3 => (61..90),
     4 => (91..120)
   }
-  VALID_DOGE_TYPES = %w(ponyboy shump)
+  TEMP_DIR = File.join(Rails.root, "tmp")
+  VALID_DOGE_TYPES = %w(doge ponyboy shump)
   VALID_DOGE_TYPE_HASHTAGS = VALID_DOGE_TYPES.map { |t| "##{t}" }
+  DOGES = Hash[
+    VALID_DOGE_TYPES.map do |doge|
+      [doge, Doger::Doge.new(File.join(BASE_IMAGE_DIR, "#{doge}.jpg"), auto_generate_zones: true)]
+    end
+  ]
 
   before_action :check_slack_token, only: [:slack]
 
@@ -44,18 +29,24 @@ class DogeifyController < ApplicationController
 
   def slack
     split_text = params[:text].split(" ")
-    image = split_text.delete("#image")
-    doge_type_hashtag = VALID_DOGE_TYPE_HASHTAGS.detect { |t| t == split_text.first }
-    if doge_type_hashtag
-      split_text.shift
-      doge_type = doge_type_hashtag.sub("#", "")
-    else
-      doge_type = 'doge'
-    end
-    text = split_text.join(" ")
-    dogeified_text = text.to_s.dogeify
+    is_text = split_text.delete("#text")
 
-    if image
+    if is_text
+      dogeified_text = split_text.join(" ").dogeify
+      slack_text = formatted_dogeified_text(dogeified_text)
+      response_payload = {
+        response_type: "in_channel",
+        text: slack_text
+      }
+    else # is image
+      doge_type_hashtag = VALID_DOGE_TYPE_HASHTAGS.detect { |t| t == split_text.first }
+      if doge_type_hashtag
+        split_text.shift
+        doge_type = doge_type_hashtag.sub("#", "")
+      else
+        doge_type = "doge"
+      end
+      dogeified_text = split_text.join(" ").dogeify
       doge_url = generate_doge_image_and_get_url(dogeified_text, doge_type: doge_type)
       response_payload = {
         response_type: "in_channel",
@@ -63,15 +54,9 @@ class DogeifyController < ApplicationController
           {
             type: "image",
             image_url: doge_url,
-            alt_text: "doge meme"
+            alt_text: dogeified_text
           }
         ]
-      }
-    else
-      slack_text = formatted_doge_text(dogeified_text)
-      response_payload = {
-        response_type: "in_channel",
-        text: slack_text
       }
     end
     render json: response_payload, status: :ok
@@ -87,7 +72,7 @@ class DogeifyController < ApplicationController
     @filename ||= "#{id}.jpg"
   end
 
-  def formatted_doge_text(dogeified_text)
+  def formatted_dogeified_text(dogeified_text)
     last_two_sections = []
     dogeified_text.
       split(".").
@@ -100,46 +85,16 @@ class DogeifyController < ApplicationController
       end.join("\n")
   end
 
-  def generate_doge_image(source_image_path, id, phrases)
-    return if phrases.empty?
-    phrase = phrases.shift
-    gravity, shifts = get_gravity
-    x_shift = sprintf("%+d", shifts[:x].sample)
-    y_shift = sprintf("%+d", shifts[:y].sample)
-    FileUtils.mkdir_p(File.join(PUBLIC_DIR, date_path))
-    output_path = File.join(PUBLIC_DIR, date_path, doge_image_filename(id))
-    command = %Q(
-      convert #{source_image_path} \
-      -fill "#{get_color}" \
-      -font Comic-Sans-MS \
-      -pointsize #{rand(18..24)} \
-      -gravity #{gravity} \
-      -annotate #{x_shift}#{y_shift} '#{phrase}' \
-      #{output_path}
-    )
-    `#{command}`
-    generate_doge_image(output_path, id, phrases)
-  end
-
-  def generate_doge_image_and_get_url(dogeified_text, doge_type: 'doge')
-    phrases = dogeified_text.split(".")
-    id = SecureRandom.uuid
-    base_image_path = File.join(BASE_IMAGE_DIR, "#{doge_type}.jpg")
-    generate_doge_image(base_image_path, id, phrases)
-    date_path_and_filename = File.join(date_path,  doge_image_filename(id))
-    url = URI.join(url_for(controller: "dogeify", action: "index", trailing_slash: true), date_path_and_filename).to_s
-  end
-
-  def get_color
-    @colors ||= COLORS.dup
-    @colors += COLORS if @colors.empty?
-    @colors.delete_at(rand(@colors.length))
-  end
-
-  def get_gravity
-    @gravities ||= GRAVITIES.dup
-    @gravities += GRAVITIES if @gravities.empty?
-    @gravities.delete_at(rand(@gravities.length))
+  def generate_doge_image_and_get_url(dogeified_text, doge_type: "doge")
+    local_dir = File.join(TEMP_DIR, date_path)
+    FileUtils.mkdir_p(local_dir)
+    file_name = "#{SecureRandom.uuid}.jpg"
+    local_file_path = File.join(local_dir, file_name)
+    remote_file_path = File.join(date_path, file_name)
+    DOGES[doge_type].generate_image(local_file_path, dogeified_text.split("."))
+    file = GCS_BUCKET.create_file(local_file_path, remote_file_path)
+    FileUtils.rm(local_file_path)
+    file.public_url
   end
 
 end
